@@ -1,0 +1,194 @@
+version: "3.9"
+
+# ── claims-slm infrastructure stack ──────────────────────────────────────────
+#
+# Services:
+#   ollama         — Ollama model server (serves claims-slm at :11434)
+#   trainer        — One-shot LoRA fine-tuning job (exits after training)
+#   cognitive-loop — Node.js cognitive loop API (exposes :3100)
+#
+# Usage:
+#   docker compose up -d ollama cognitive-loop   # Start the runtime
+#   docker compose run --rm trainer               # Trigger a training run
+#
+# Environment variables (set in .env or override on CLI):
+#   CORPUS_PATH          Path to JSONL training corpus (default: /data/corpus/corpus.jsonl)
+#   ADAPTER_PATH         Path to write/read LoRA adapter weights (default: /data/adapter)
+#   OLLAMA_MODEL         Ollama model name (default: claims-slm)
+#   COGNITIVE_LOOP_PORT  Port for the cognitive loop API (default: 3100)
+#   TTRUTHDESK_URL       URL of the ttruthdesk-platform backend (for webhook integration)
+
+x-common-env: &common-env
+  OLLAMA_HOST: http://ollama:11434
+  CORPUS_PATH: ${CORPUS_PATH:-/data/corpus/corpus.jsonl}
+  ADAPTER_PATH: ${ADAPTER_PATH:-/data/adapter}
+  OLLAMA_MODEL: ${OLLAMA_MODEL:-claims-slm}
+
+services:
+  # ── Ollama model server ───────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: claims-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+      - ./Modelfile:/modelfile/Modelfile:ro
+      - adapter-data:/data/adapter:ro
+    environment:
+      OLLAMA_KEEP_ALIVE: "24h"
+      OLLAMA_NUM_PARALLEL: "2"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - slm-net
+
+  # ── Model initialiser (runs once, then exits) ─────────────────────────────
+  # Pulls the base model and creates the claims-slm model from the Modelfile.
+  # Run: docker compose run --rm model-init
+  model-init:
+    image: ollama/ollama:latest
+    container_name: claims-model-init
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - ./Modelfile:/modelfile/Modelfile:ro
+      - ollama-data:/root/.ollama
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Pulling base model..."
+        ollama pull qwen2.5-coder:1.5b-instruct
+        echo "Creating claims-slm from Modelfile..."
+        ollama create claims-slm -f /modelfile/Modelfile
+        echo "Model ready."
+    networks:
+      - slm-net
+    profiles:
+      - init
+
+  # ── LoRA fine-tuning trainer (one-shot job) ───────────────────────────────
+  # Runs the fine-tuning pipeline and exits. The adapter weights are written
+  # to the shared adapter-data volume. After this job completes, run
+  # model-refresh to update the Ollama model.
+  trainer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: final
+    container_name: claims-trainer
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - corpus-data:/data/corpus
+      - adapter-data:/data/adapter
+      - ./Modelfile:/app/Modelfile:ro
+    environment:
+      <<: *common-env
+      PYTHONUNBUFFERED: "1"
+    command:
+      - python
+      - finetunePipeline.py
+      - --corpus
+      - /data/corpus/corpus.jsonl
+      - --output
+      - /data/adapter
+      - --cpu
+    networks:
+      - slm-net
+    profiles:
+      - training
+
+  # ── Model refresh (runs after trainer, updates Ollama) ────────────────────
+  model-refresh:
+    image: ollama/ollama:latest
+    container_name: claims-model-refresh
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - ./Modelfile:/modelfile/Modelfile:ro
+      - ollama-data:/root/.ollama
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Refreshing claims-slm model..."
+        ollama create claims-slm -f /modelfile/Modelfile
+        echo "Model refreshed."
+    networks:
+      - slm-net
+    profiles:
+      - training
+
+  # ── Cognitive loop API ────────────────────────────────────────────────────
+  # Node.js service that exposes the 5-layer cognitive loop HTTP API.
+  # Connects to Ollama for inference and to ttruthdesk for verdict events.
+  cognitive-loop:
+    image: node:20-slim
+    container_name: claims-cognitive-loop
+    working_dir: /app
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+    ports:
+      - "${COGNITIVE_LOOP_PORT:-3100}:3100"
+    volumes:
+      - corpus-data:/data/corpus
+      - adapter-data:/data/adapter:ro
+      - ./cortex.yaml:/app/cortex.yaml:ro
+      # Mount the cognitive-loop-framework source (dev mode)
+      # In production, replace with a built image
+      - ${COGNITIVE_LOOP_SRC:-../cognitive-loop-framework}:/app/src:ro
+    environment:
+      <<: *common-env
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: "3100"
+      TTRUTHDESK_URL: ${TTRUTHDESK_URL:-http://host.docker.internal:3000}
+      CORPUS_TRAINING_THRESHOLD: ${CORPUS_TRAINING_THRESHOLD:-50}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3100/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks:
+      - slm-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+# ── Volumes ───────────────────────────────────────────────────────────────────
+volumes:
+  ollama-data:
+    driver: local
+    labels:
+      com.claims-slm.description: "Ollama model weights and registry"
+
+  corpus-data:
+    driver: local
+    labels:
+      com.claims-slm.description: "JSONL training corpus (grows with each verified claim)"
+
+  adapter-data:
+    driver: local
+    labels:
+      com.claims-slm.description: "LoRA adapter weights (written by trainer, read by Ollama)"
+
+# ── Networks ──────────────────────────────────────────────────────────────────
+networks:
+  slm-net:
+    driver: bridge
+    labels:
+      com.claims-slm.description: "Internal network for claims-slm services"

@@ -1,0 +1,21 @@
+# claims-slm fine-tuning dependencies
+# Pin minor versions for reproducibility; allow patch updates
+
+# Core ML stack
+torch>=2.2.0,<3.0.0
+transformers>=4.40.0,<5.0.0
+peft>=0.10.0,<1.0.0
+datasets>=2.18.0,<4.0.0
+accelerate>=0.28.0,<2.0.0
+
+# Tokenizer support
+sentencepiece>=0.1.99
+tokenizers>=0.19.0
+
+# Utilities
+numpy>=1.26.0,<2.0.0
+tqdm>=4.66.0
+safetensors>=0.4.3
+
+# Optional: faster training on CPU
+# intel-extension-for-pytorch  # Uncomment for Intel CPU acceleration

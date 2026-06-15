@@ -1,0 +1,165 @@
+# cortex.yaml — cognitive-loop-framework configuration
+#
+# This file is the developer-facing configuration for the cognitive loop.
+# The developer configures domain-specific inputs and rules here.
+# The framework handles all orchestration, fine-tuning, and self-healing.
+#
+# Full schema reference: https://github.com/Gudmundur76/slm-infra-deploy/docs/cortex-schema.md
+
+# ── Project identity ──────────────────────────────────────────────────────────
+project: citation-is
+version: "1.0"
+
+# Domain tells the framework which vertical adapters to activate.
+# Supported: biotech | legal | finance | general
+domain: biotech
+
+# ── SLM configuration ─────────────────────────────────────────────────────────
+slm:
+  # Base model for fine-tuning (must be available in Ollama registry)
+  base_model: qwen2.5-coder:1.5b-instruct
+
+  # Name of the fine-tuned model in Ollama
+  model_name: claims-slm
+
+  # Path to the fine-tuning script (relative to this file)
+  pipeline_script: ./finetunePipeline.py
+
+  # Path to the Ollama Modelfile
+  modelfile: ./Modelfile
+
+  # LoRA adapter output directory
+  adapter_output: ./adapter
+
+  # Number of new training examples required before triggering a fine-tune run
+  # (maps to CorpusWatcher threshold)
+  training_threshold: 50
+
+  # Training parameters (passed to finetunePipeline.py)
+  training:
+    epochs: 3
+    max_seq_len: 512
+    cpu_only: true          # Set false if GPU is available
+
+# ── Data sources ──────────────────────────────────────────────────────────────
+# Each source is polled by the domain ingest scheduler.
+sources:
+  - type: pubmed
+    endpoint: https://eutils.ncbi.nlm.nih.gov/entrez/eutils
+    enabled: true
+
+  - type: uniprot
+    endpoint: https://rest.uniprot.org
+    enabled: true
+
+  - type: pdb
+    endpoint: https://data.rcsb.org
+    enabled: true
+
+  - type: crossref
+    endpoint: https://api.crossref.org
+    enabled: true
+
+  - type: noaa
+    endpoint: https://www.ncdc.noaa.gov/cdo-web/api/v2
+    enabled: false           # Requires NOAA_CDO_TOKEN env var
+    env_key: NOAA_CDO_TOKEN
+
+  - type: fred
+    endpoint: https://api.stlouisfed.org/fred
+    enabled: false           # Requires FRED_API_KEY env var
+    env_key: FRED_API_KEY
+
+  - type: imf
+    endpoint: https://dataservices.imf.org/REST/SDMX_JSON.svc
+    enabled: true
+
+# ── Verification rules ────────────────────────────────────────────────────────
+# Rules applied at L1 (truth layer) during claim verification.
+verification_rules:
+  - name: pubmed_paper_count
+    layer: L1
+    description: "Require at least 2 peer-reviewed papers to mark a claim Supported"
+    threshold: 2
+
+  - name: protein_sequence_match
+    layer: L1
+    description: "Require PDB/UniProt structural evidence for protein claims"
+    threshold: 0.95
+
+  - name: retraction_check
+    layer: L1
+    description: "Flag claims citing retracted papers via Crossref/Scite"
+    enabled: true
+
+  - name: contradiction_detection
+    layer: L1
+    description: "Surface contradicting claims from the knowledge graph"
+    enabled: true
+
+# ── Self-prompting (L2 — reasoning layer) ─────────────────────────────────────
+self_prompt:
+  model: claims-slm           # Use the local fine-tuned model
+  fallback_model: qwen2.5-coder:1.5b-instruct
+  temperature: 0.1
+  max_tokens: 512
+  # Prompt templates for each task type
+  templates:
+    classify: "Classify the scientific claim as Supported, Refuted, Inconclusive, or Needs Context."
+    extract:  "Extract all scientific entities from the sentence."
+    contradict: "Determine the relationship between the two scientific claims."
+    provenance: "Explain the provenance chain that supports or refutes this claim."
+    score: "Assign a confidence score from 0.0 to 1.0 for how well the evidence supports the claim."
+
+# ── Frontier evidence pursuit (L3) ───────────────────────────────────────────
+frontier:
+  enabled: true
+  # Maximum number of additional evidence sources to query per claim
+  max_evidence_pursuit: 3
+  # Minimum confidence required before stopping evidence pursuit
+  confidence_target: 0.85
+
+# ── Meta-agent (L4 — self-healing) ───────────────────────────────────────────
+meta:
+  enabled: true
+  # Trigger self-healing when a test suite failure is detected
+  heal_on_test_failure: true
+  # Maximum number of repair attempts before escalating to human
+  max_repair_attempts: 5
+  # Test command to run after each repair attempt
+  test_command: "pnpm test"
+  # Notify via webhook on repair success/failure
+  notify_webhook: ${META_NOTIFY_WEBHOOK:-}
+
+# ── Corpus (training data) ────────────────────────────────────────────────────
+corpus:
+  # Path to the JSONL corpus file (appended by ClaimsCorpusGenerator)
+  path: /data/corpus/corpus.jsonl
+  # Backup corpus after each training run
+  backup: true
+  backup_dir: /data/corpus/backups
+
+# ── API server ────────────────────────────────────────────────────────────────
+api:
+  port: 3100
+  # Endpoints exposed by the cognitive loop
+  routes:
+    ingest:   POST /cognitive/ingest    # Submit a claim/paper/query
+    verdict:  POST /cognitive/verdict   # Get structured verdict
+    repair:   POST /cognitive/repair    # Trigger self-healing on test failure
+    health:   GET  /health              # Health check
+    status:   GET  /cognitive/status    # Loop status and metrics
+
+# ── Webhook integration ───────────────────────────────────────────────────────
+# The ttruthdesk-platform fires a POST to this URL after each claim is verified.
+# This is the entry point for the data flywheel.
+webhook:
+  # URL that ttruthdesk-platform will POST verdict events to
+  verdict_endpoint: ${COGNITIVE_LOOP_URL:-http://localhost:3100}/cognitive/ingest
+  # Shared secret for webhook authentication (HMAC-SHA256)
+  secret: ${WEBHOOK_SECRET:-change-me-in-production}
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging:
+  level: ${LOG_LEVEL:-info}    # debug | info | warn | error
+  format: json                  # json | text
