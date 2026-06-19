@@ -12,11 +12,13 @@ This is the developer-facing entry point described in the product spec.
 """
 
 import argparse
+import http.server
 import json
 import os
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 # ── Version ───────────────────────────────────────────────────────────────────
@@ -227,6 +229,73 @@ def cmd_version(_args: argparse.Namespace) -> None:
     print(f"cortex v{VERSION} — cognitive-loop-framework CLI")
 
 
+# ── HTTP /verify endpoint ─────────────────────────────────────────────────────
+
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+MODEL_NAME = os.environ.get("CLAIM_VERIFIER_MODEL", "claim-verifier")
+SERVE_PORT = int(os.environ.get("CORTEX_SERVE_PORT", "8765"))
+
+
+def _ollama_generate(claim: str) -> dict:
+    """Call Ollama /api/generate and return parsed JSON verdict."""
+    payload = json.dumps({
+        "model": MODEL_NAME,
+        "prompt": claim,
+        "stream": False,
+        "format": "json",
+    }).encode()
+    req = urllib.request.Request(
+        f"{OLLAMA_URL}/api/generate",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        body = json.loads(resp.read())
+    return json.loads(body.get("response", "{}"))
+
+
+class _VerifyHandler(http.server.BaseHTTPRequestHandler):
+    """Minimal HTTP handler for POST /verify."""
+
+    def log_message(self, fmt: str, *args: object) -> None:  # silence default logs
+        pass
+
+    def do_POST(self) -> None:  # noqa: N802
+        if self.path != "/verify":
+            self.send_error(404, "Not Found")
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(length))
+        claim = body.get("claim", "")
+        if not claim:
+            self._json(400, {"error": "Missing 'claim' field"})
+            return
+        try:
+            result = _ollama_generate(claim)
+            self._json(200, result)
+        except Exception as exc:
+            self._json(503, {"error": "Local model unavailable", "fallback": True, "detail": str(exc)})
+
+    def _json(self, status: int, data: dict) -> None:
+        payload = json.dumps(data).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+def cmd_serve(_args: argparse.Namespace) -> None:
+    """Start the /verify HTTP server on CORTEX_SERVE_PORT (default 8765)."""
+    print(f"[cortex] Starting /verify server on port {SERVE_PORT} (model: {MODEL_NAME})")
+    server = http.server.HTTPServer(("", SERVE_PORT), _VerifyHandler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("[cortex] Server stopped.")
+
+
 # ── Argument parser ───────────────────────────────────────────────────────────
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -254,7 +323,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     # status
     sub.add_parser("status", help="Show cognitive loop stack status")
-
+    # serve
+    sub.add_parser("serve", help="Start the /verify HTTP server (port CORTEX_SERVE_PORT, default 8765)")
     return parser
 
 
@@ -273,6 +343,7 @@ def main() -> None:
         "run": cmd_run,
         "train": cmd_train,
         "status": cmd_status,
+        "serve": cmd_serve,
     }
     dispatch[args.command](args)
 
