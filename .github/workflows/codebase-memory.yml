@@ -1,0 +1,51 @@
+name: codebase-memory
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  index:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install codebase-memory-mcp
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh \
+            -o /tmp/cbm-install.sh
+          bash /tmp/cbm-install.sh --skip-config
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Index repository (full mode)
+        run: |
+          SLUG=$(echo "${{ github.repository }}" | tr '/' '-')
+          codebase-memory-mcp cli index_repository \
+            "{\"repo_path\":\"${{ github.workspace }}\",\"project\":\"$SLUG\",\"mode\":\"full\"}"
+
+      - name: Export compressed graph snapshot
+        run: |
+          mkdir -p .codebase-memory
+          SLUG=$(echo "${{ github.repository }}" | tr '/' '-')
+          DB_FILE="$HOME/.cache/codebase-memory-mcp/${SLUG}.db"
+          if [ ! -f "$DB_FILE" ]; then
+            DB_FILE=$(ls "$HOME/.cache/codebase-memory-mcp/"*.db 2>/dev/null | grep -v _config | head -1)
+          fi
+          echo "Compressing $DB_FILE"
+          gzip -9 -c "$DB_FILE" > .codebase-memory/graph.db.gz
+          ls -lh .codebase-memory/graph.db.gz
+
+      - name: Commit snapshot to repo
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .codebase-memory/graph.db.gz .codebase-memory/README.md 2>/dev/null || true
+          git diff --cached --quiet && echo "No changes to graph snapshot" || \
+            git commit -m "chore(graph): update codebase-memory snapshot [skip ci]"
+          git push
