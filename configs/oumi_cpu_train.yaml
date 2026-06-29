@@ -1,0 +1,79 @@
+# oumi_cpu_train.yaml
+#
+# Oumi SFT + LoRA config for claims-slm incremental fine-tuning.
+#
+# Model: Qwen/Qwen2.5-1.5B-Instruct (CPU-feasible, ~3 GB)
+# Method: LoRA (r=8, alpha=16, q_proj + v_proj)
+# Dataset: local JSONL corpus converted to HuggingFace dataset by oumiPipeline.py
+#
+# Usage (called by oumiPipeline.py):
+#   oumi train -c configs/oumi_cpu_train.yaml \
+#     --training.output_dir <output_path>
+#
+# CPU constraints:
+#   - torch_dtype_str: float32 (bfloat16 unsupported on most CPUs)
+#   - per_device_train_batch_size: 1
+#   - gradient_accumulation_steps: 8 (effective batch = 8)
+#   - no flash attention, no liger kernel, no FSDP
+#   - dataloader_num_workers: 0 (avoids multiprocessing issues on CPU)
+#
+# See Also:
+#   - Oumi docs: https://oumi.ai/docs/en/latest/user_guides/train/train.html
+#   - HallOumi training: https://github.com/oumi-ai/oumi/tree/main/configs/projects/halloumi
+
+model:
+  model_name: "Qwen/Qwen2.5-1.5B-Instruct"
+  model_max_length: 512
+  torch_dtype_str: "float32"
+  attn_implementation: "eager"
+  load_pretrained_weights: true
+  trust_remote_code: true
+  enable_liger_kernel: false
+  chat_template: "qwen2-instruct"
+
+peft:
+  lora:
+    r: 8
+    lora_alpha: 16
+    target_modules:
+      - "q_proj"
+      - "v_proj"
+    lora_dropout: 0.05
+    bias: "none"
+    task_type: "CAUSAL_LM"
+
+data:
+  train:
+    # Dataset is written to /tmp/oumi_claims_dataset by oumiPipeline.py
+    # before calling oumi train. The dataset_name points to that local path.
+    datasets:
+      - dataset_name: "PromptResponseDataset"
+        dataset_kwargs:
+          hf_dataset_path: "__CORPUS_DATASET_PATH__"
+          messages_column: "messages"
+        shuffle: true
+        seed: 42
+
+training:
+  output_dir: "__OUTPUT_DIR__"
+  trainer_type: "TRL_SFT"
+  enable_gradient_checkpointing: false
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 8
+  num_train_epochs: 3
+  learning_rate: 2.0e-4
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.05
+  weight_decay: 0.01
+  optimizer: "adamw_torch"
+  max_grad_norm: 1.0
+  logging_steps: 10
+  save_steps: 100
+  save_final_model: true
+  dataloader_num_workers: 0
+  dataloader_prefetch_factor: null
+  include_performance_metrics: false
+  log_model_summary: false
+  enable_wandb: false
+  compile: false
+  ddp_find_unused_parameters: false
