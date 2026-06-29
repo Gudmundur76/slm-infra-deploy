@@ -34,9 +34,9 @@ with patch.dict("sys.modules", _ML_MOCKS):
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 @pytest.fixture
 def tmp_corpus(tmp_path: Path) -> Path:
-    """Create a minimal JSONL corpus with 3 training pairs."""
+    """Create a minimal JSONL corpus with 10 training pairs (minimum required by pipeline)."""
     corpus = tmp_path / "corpus.jsonl"
-    pairs = [
+    base_pairs = [
         {
             "instruction": "Classify the scientific claim.",
             "input": "Protein XYZ binds to receptor ABC.",
@@ -56,6 +56,16 @@ def tmp_corpus(tmp_path: Path) -> Path:
             "type": "provenance",
         },
     ]
+    # Pad to 10 pairs to satisfy the minimum corpus size requirement
+    pairs = base_pairs + [
+        {
+            "instruction": f"Classify claim {i}.",
+            "input": f"Molecule {i} inhibits enzyme {i}.",
+            "output": f"Supported (confidence: 0.{80 + i})",
+            "type": "classify",
+        }
+        for i in range(7)
+    ]
     with corpus.open("w") as f:
         for pair in pairs:
             f.write(json.dumps(pair) + "\n")
@@ -74,7 +84,7 @@ def tmp_output(tmp_path: Path) -> Path:
 class TestCorpusLoading:
     def test_loads_all_lines(self, tmp_corpus: Path) -> None:
         pairs = fp.load_corpus(str(tmp_corpus))
-        assert len(pairs) == 3
+        assert len(pairs) == 10
 
     def test_each_pair_has_required_fields(self, tmp_corpus: Path) -> None:
         pairs = fp.load_corpus(str(tmp_corpus))
@@ -89,19 +99,25 @@ class TestCorpusLoading:
 
     def test_skips_empty_lines(self, tmp_path: Path) -> None:
         corpus = tmp_path / "corpus_empty_lines.jsonl"
-        corpus.write_text(
-            '{"instruction":"i","input":"x","output":"y","type":"classify"}\n\n\n'
-        )
+        # Write 10 valid lines plus empty lines to satisfy minimum corpus size
+        lines = ""
+        for i in range(10):
+            lines += json.dumps({"instruction": f"i{i}", "input": f"x{i}", "output": f"y{i}", "type": "classify"}) + "\n"
+        lines += "\n\n"  # extra empty lines that should be skipped
+        corpus.write_text(lines)
         pairs = fp.load_corpus(str(corpus))
-        assert len(pairs) == 1
+        assert len(pairs) == 10
 
     def test_skips_malformed_json_lines(self, tmp_path: Path) -> None:
         corpus = tmp_path / "corpus_malformed.jsonl"
-        corpus.write_text(
-            '{"instruction":"i","input":"x","output":"y","type":"classify"}\n{INVALID}\n'
-        )
+        # Write 10 valid lines plus 1 malformed line
+        lines = ""
+        for i in range(10):
+            lines += json.dumps({"instruction": f"i{i}", "input": f"x{i}", "output": f"y{i}", "type": "classify"}) + "\n"
+        lines += "{INVALID}\n"  # malformed line that should be skipped
+        corpus.write_text(lines)
         pairs = fp.load_corpus(str(corpus))
-        assert len(pairs) == 1
+        assert len(pairs) == 10
 
 
 # ── Tests: prompt formatting ──────────────────────────────────────────────────
@@ -136,32 +152,32 @@ class TestIncrementalDelta:
     def test_returns_all_records_when_no_prior_run(
         self, tmp_corpus: Path, tmp_output: Path
     ) -> None:
-        """First run: checkpoint at 0 → all 3 pairs are new."""
+        """First run: checkpoint at 0 → all 10 pairs are new."""
         records = fp.load_corpus(str(tmp_corpus))
         delta, total = fp.get_delta_records(records, str(tmp_output))
-        assert len(delta) == 3
-        assert total == 3
+        assert len(delta) == 10
+        assert total == 10
 
     def test_returns_empty_when_all_trained(
         self, tmp_corpus: Path, tmp_output: Path
     ) -> None:
-        """Second run: checkpoint at 3 → no new pairs."""
+        """Second run: checkpoint at 10 → no new pairs."""
         records = fp.load_corpus(str(tmp_corpus))
-        # Simulate a prior training run that processed all 3 records
-        fp.write_trained_count(str(tmp_output), 3)
+        # Simulate a prior training run that processed all 10 records
+        fp.write_trained_count(str(tmp_output), 10)
         delta, total = fp.get_delta_records(records, str(tmp_output))
         assert len(delta) == 0
-        assert total == 3
+        assert total == 10
 
     def test_returns_only_new_records(self, tmp_path: Path) -> None:
-        """Third run: checkpoint at 2, 5 total → 3 new pairs."""
+        """Third run: checkpoint at 2, 12 total → 10 new pairs."""
         corpus = tmp_path / "corpus.jsonl"
         output = tmp_path / "adapter"
         output.mkdir()
 
-        # Write 5 pairs
+        # Write 12 pairs (above the 10-minimum threshold)
         with corpus.open("w") as f:
-            for i in range(5):
+            for i in range(12):
                 f.write(json.dumps({
                     "instruction": f"inst {i}",
                     "input": f"input {i}",
@@ -173,8 +189,8 @@ class TestIncrementalDelta:
         # Simulate 2 already trained
         fp.write_trained_count(str(output), 2)
         delta, total = fp.get_delta_records(records, str(output))
-        assert len(delta) == 3
-        assert total == 5
+        assert len(delta) == 10
+        assert total == 12
 
     def test_trained_count_persists_to_disk(self, tmp_output: Path) -> None:
         """write_trained_count / read_trained_count round-trip."""
