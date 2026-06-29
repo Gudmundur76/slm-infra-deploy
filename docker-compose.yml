@@ -142,6 +142,43 @@ services:
     profiles:
       - ornith
 
+
+  # ── Ornith-1.0-9B CPU inference (llama.cpp llama-server) ─────────────────
+  # CPU-only alternative to ornith-vllm. No GPU required.
+  # Requires the GGUF model to be pre-downloaded to ORNITH_MODEL_PATH.
+  # Download: ./scripts/download-ornith-model.sh
+  #
+  # Run: docker compose --profile ornith-cpu up -d ornith-llamacpp
+  # Set: LLM_PROVIDER=ornith_slm  ORNITH_SLM_URL=http://localhost:8080
+  ornith-llamacpp:
+    image: ghcr.io/ggerganov/llama.cpp:server
+    container_name: claims-ornith-cpu
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - type: bind
+        source: ${ORNITH_MODEL_DIR:-/opt/models/ornith}
+        target: /models
+    environment:
+      LLAMA_ARG_MODEL: /models/${ORNITH_MODEL_FILE:-ornith-1.0-9b-q4_k_m.gguf}
+      LLAMA_ARG_HOST: 0.0.0.0
+      LLAMA_ARG_PORT: "8080"
+      LLAMA_ARG_CTX_SIZE: "${ORNITH_CTX_SIZE:-8192}"
+      LLAMA_ARG_N_THREADS: "${ORNITH_THREADS:-4}"
+      LLAMA_ARG_ALIAS: ornith-1.0-9b
+      LLAMA_ARG_CHAT_TEMPLATE: chatml
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks:
+      - slm-net
+    profiles:
+      - ornith-cpu
+
   # ── LoRA fine-tuning trainer (one-shot job) ───────────────────────────────
   # Runs the fine-tuning pipeline and exits. The adapter weights are written
   # to the shared adapter-data volume. After this job completes, run

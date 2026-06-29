@@ -292,6 +292,10 @@ def cmd_version(_args: argparse.Namespace) -> None:
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 MODEL_NAME = os.environ.get("CLAIM_VERIFIER_MODEL", "claim-verifier")
 SERVE_PORT = int(os.environ.get("CORTEX_SERVE_PORT", "8765"))
+# LLM_PROVIDER selects the inference backend for POST /verify.
+# "ollama"      — Ollama /api/generate (default, CPU-friendly)
+# "ornith_slm"  — Ornith-1.0 OpenAI-compatible endpoint (llama-server or vLLM)
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "ollama")
 
 
 def _ollama_generate(claim: str) -> dict:
@@ -330,7 +334,7 @@ class _VerifyHandler(http.server.BaseHTTPRequestHandler):
             self._json(400, {"error": "Missing 'claim' field"})
             return
         try:
-            result = _ollama_generate(claim)
+            result = _generate(claim)
             self._json(200, result)
         except Exception as exc:
             self._json(503, {"error": "Local model unavailable", "fallback": True, "detail": str(exc)})
@@ -342,6 +346,73 @@ class _VerifyHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
+
+
+def _ornith_generate(claim: str) -> dict:
+    """
+    Call the Ornith-1.0 OpenAI-compatible /v1/chat/completions endpoint
+    and return a parsed JSON verdict dict.
+
+    Works with both:
+      - llama.cpp llama-server (CPU, no GPU required)
+      - vLLM ornith-vllm service (GPU)
+    Both expose the same OpenAI-compatible API on ORNITH_URL.
+
+    Ornith returns a <think>...</think> reasoning block before the JSON
+    answer. We strip the reasoning block and parse the JSON payload.
+    """
+    import re as _re
+    ornith_base = ORNITH_URL.rstrip("/")
+    system_prompt = (
+        "You are a scientific claim verification engine. "
+        "Given a claim, return a JSON object with: "
+        "verdict (one of Supported, Contradicted, Partially Supported, "
+        "Ambiguous, Insufficient Evidence, Out of Scope, Needs Expert Review), "
+        "confidence (0.0\u20131.0), reasoning (brief explanation), "
+        "sources (array of {database, id, url}). "
+        "Respond only with valid JSON. No markdown."
+    )
+    payload = json.dumps({
+        "model": ORNITH_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": claim},
+        ],
+        "temperature": 0.1,
+        "max_tokens": 512,
+        "stream": False,
+    }).encode()
+    req = urllib.request.Request(
+        f"{ornith_base}/v1/chat/completions",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {os.environ.get('ORNITH_SLM_API_KEY', 'ornith-local')}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        body = json.loads(resp.read())
+    content: str = body["choices"][0]["message"]["content"]
+    # Strip Ornith <think>...</think> reasoning block
+    content = _re.sub(r"<think>[\s\S]*?</think>\s*", "", content).strip()
+    # Handle markdown code fences if model wraps output
+    if content.startswith("```"):
+        content = content.split("```")[1]
+        if content.startswith("json"):
+            content = content[4:]
+    return json.loads(content.strip())
+
+
+def _generate(claim: str) -> dict:
+    """
+    Route claim verification to the configured LLM backend.
+    LLM_PROVIDER=ollama      → Ollama /api/generate (default)
+    LLM_PROVIDER=ornith_slm  → Ornith-1.0 OpenAI-compatible endpoint
+    """
+    if LLM_PROVIDER == "ornith_slm":
+        return _ornith_generate(claim)
+    return _ollama_generate(claim)
 
 
 def cmd_serve(_args: argparse.Namespace) -> None:
