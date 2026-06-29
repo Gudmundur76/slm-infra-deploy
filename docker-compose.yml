@@ -17,6 +17,12 @@ version: "3.9"
 #   OLLAMA_MODEL         Ollama model name (default: claims-slm)
 #   COGNITIVE_LOOP_PORT  Port for the cognitive loop API (default: 3100)
 #   TTRUTHDESK_URL       URL of the ttruthdesk-platform backend (for webhook integration)
+#   ORNITH_HF_TOKEN      HuggingFace token to download Ornith-1.0-9B weights
+#   ORNITH_GPU_UTIL      GPU memory utilisation for vLLM (default: 0.85)
+#
+# Ornith-1.0-9B usage:
+#   docker compose up -d ornith-vllm cognitive-loop   # Use Ornith instead of Ollama
+#   Set LLM_PROVIDER=ornith_slm in ttruthdesk .env to route traffic to Ornith
 
 x-common-env: &common-env
   OLLAMA_HOST: http://ollama:11434
@@ -74,6 +80,57 @@ services:
       - slm-net
     profiles:
       - init
+
+  # ── Ornith-1.0-9B via vLLM (OpenAI-compatible inference) ────────────────
+  # Serves Ornith-1.0-9B at :8080 with an OpenAI-compatible API.
+  # Requires an NVIDIA GPU with ≥19 GB VRAM (A10G / L4 / RTX 4090).
+  # Set LLM_PROVIDER=ornith_slm in ttruthdesk .env to route all LLM traffic here.
+  #
+  # Run: docker compose up -d ornith-vllm
+  ornith-vllm:
+    image: vllm/vllm-openai:latest
+    container_name: claims-ornith-vllm
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ornith-weights:/root/.cache/huggingface
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${ORNITH_HF_TOKEN:-}
+      VLLM_WORKER_MULTIPROC_METHOD: spawn
+    command:
+      - --model
+      - DeepReinforce/Ornith-1.0-9B
+      - --port
+      - "8080"
+      - --host
+      - "0.0.0.0"
+      - --gpu-memory-utilization
+      - "${ORNITH_GPU_UTIL:-0.85}"
+      - --max-model-len
+      - "32768"
+      - --dtype
+      - bfloat16
+      - --enable-prefix-caching
+      - --served-model-name
+      - ornith-1.0-9b
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 120s
+    networks:
+      - slm-net
+    profiles:
+      - ornith
 
   # ── LoRA fine-tuning trainer (one-shot job) ───────────────────────────────
   # Runs the fine-tuning pipeline and exits. The adapter weights are written
@@ -185,6 +242,11 @@ volumes:
     driver: local
     labels:
       com.claims-slm.description: "LoRA adapter weights (written by trainer, read by Ollama)"
+
+  ornith-weights:
+    driver: local
+    labels:
+      com.claims-slm.description: "Ornith-1.0-9B model weights cache (HuggingFace hub download)"
 
 # ── Networks ──────────────────────────────────────────────────────────────────
 networks:
