@@ -6,10 +6,13 @@ version: "3.9"
 #   ollama         — Ollama model server (serves claims-slm at :11434)
 #   trainer        — One-shot LoRA fine-tuning job (exits after training)
 #   cognitive-loop — Node.js cognitive loop API (exposes :3100)
+#   ttruthdesk-ctc — CTC sidecar for ttruthdesk-platform (exposes :7700)
+#   clf-ctc        — CTC sidecar for cognitive-loop-framework (exposes :7701)
 #
 # Usage:
-#   docker compose up -d ollama cognitive-loop   # Start the runtime
-#   docker compose run --rm trainer               # Trigger a training run
+#   docker compose up -d ollama cognitive-loop             # Start the runtime
+#   docker compose up -d ollama cognitive-loop ttruthdesk-ctc clf-ctc  # With CTC
+#   docker compose run --rm trainer                        # Trigger a training run
 #
 # Environment variables (set in .env or override on CLI):
 #   CORPUS_PATH          Path to JSONL training corpus (default: /data/corpus/corpus.jsonl)
@@ -19,6 +22,9 @@ version: "3.9"
 #   TTRUTHDESK_URL       URL of the ttruthdesk-platform backend (for webhook integration)
 #   ORNITH_HF_TOKEN      HuggingFace token to download Ornith-1.0-9B weights
 #   ORNITH_GPU_UTIL      GPU memory utilisation for vLLM (default: 0.85)
+#   CTC_TTRUTHDESK_PORT  Port for the ttruthdesk CTC sidecar (default: 7700)
+#   CTC_CLF_PORT         Port for the CLF CTC sidecar (default: 7701)
+#   EVOLVA_MRAGENT_PATH  Path to evolva-mragent repo (default: ../evolva-mragent)
 #
 # Ornith-1.0-9B usage:
 #   docker compose up -d ornith-vllm cognitive-loop   # Use Ornith instead of Ollama
@@ -29,6 +35,10 @@ x-common-env: &common-env
   CORPUS_PATH: ${CORPUS_PATH:-/data/corpus/corpus.jsonl}
   ADAPTER_PATH: ${ADAPTER_PATH:-/data/adapter}
   OLLAMA_MODEL: ${OLLAMA_MODEL:-claims-slm}
+
+x-ctc-env: &ctc-env
+  EVOLVA_MRAGENT_PATH: ${EVOLVA_MRAGENT_PATH:-/evolva-mragent}
+  CTC_LOG_LEVEL: ${LOG_LEVEL:-info}
 
 services:
   # ── Ollama model server ───────────────────────────────────────────────────
@@ -188,6 +198,77 @@ services:
     profiles:
       - training
 
+  # ── CTC sidecar — ttruthdesk-platform ────────────────────────────────────
+  # Python sidecar that runs the MRAgent CTC memory graph for ttruthdesk.
+  # Exposes a JSON-RPC socket at :7700 for ingest_cycle, reconstruct,
+  # temporal_query, event_keywords, and edges_by_tag.
+  #
+  # Run: docker compose up -d ttruthdesk-ctc
+  ttruthdesk-ctc:
+    image: python:3.11-slim
+    container_name: claims-ttruthdesk-ctc
+    restart: unless-stopped
+    ports:
+      - "${CTC_TTRUTHDESK_PORT:-7700}:7700"
+    volumes:
+      - ctc-data:/data/ctc
+      - ${EVOLVA_MRAGENT_PATH:-../evolva-mragent}:/evolva-mragent:ro
+    environment:
+      <<: *ctc-env
+      CTC_DB_PATH: /data/ctc/ttruthdesk_ctc.db
+      CTC_SIDECAR_PORT: "7700"
+      CTC_INSTANCE: ttruthdesk
+    working_dir: /evolva-mragent
+    entrypoint: ["python", "-u", "ctc_sidecar.py",
+                 "--db", "/data/ctc/ttruthdesk_ctc.db",
+                 "--port", "7700"]
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import socket; s=socket.create_connection(('localhost',7700),2); s.close()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - slm-net
+    profiles:
+      - ctc
+
+  # ── CTC sidecar — cognitive-loop-framework ───────────────────────────────
+  # Python sidecar that runs the MRAgent CTC memory graph for CLF.
+  # Exposes a JSON-RPC socket at :7701.
+  #
+  # Run: docker compose up -d clf-ctc
+  clf-ctc:
+    image: python:3.11-slim
+    container_name: claims-clf-ctc
+    restart: unless-stopped
+    ports:
+      - "${CTC_CLF_PORT:-7701}:7701"
+    volumes:
+      - ctc-data:/data/ctc
+      - ${EVOLVA_MRAGENT_PATH:-../evolva-mragent}:/evolva-mragent:ro
+    environment:
+      <<: *ctc-env
+      CTC_DB_PATH: /data/ctc/clf_ctc.db
+      CTC_SIDECAR_PORT: "7701"
+      CTC_INSTANCE: clf
+    working_dir: /evolva-mragent
+    entrypoint: ["python", "-u", "ctc_sidecar.py",
+                 "--db", "/data/ctc/clf_ctc.db",
+                 "--port", "7701"]
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import socket; s=socket.create_connection(('localhost',7701),2); s.close()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - slm-net
+    profiles:
+      - ctc
+
   # ── Cognitive loop API ────────────────────────────────────────────────────
   # Node.js service that exposes the 5-layer cognitive loop HTTP API.
   # Connects to Ollama for inference and to ttruthdesk for verdict events.
@@ -247,6 +328,11 @@ volumes:
     driver: local
     labels:
       com.claims-slm.description: "Ornith-1.0-9B model weights cache (HuggingFace hub download)"
+
+  ctc-data:
+    driver: local
+    labels:
+      com.claims-slm.description: "CTC SQLite databases for ttruthdesk and CLF sidecars"
 
 # ── Networks ──────────────────────────────────────────────────────────────────
 networks:

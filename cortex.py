@@ -22,8 +22,14 @@ import urllib.request
 from pathlib import Path
 
 # ── Version ───────────────────────────────────────────────────────────────────
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 CORTEX_YAML = "cortex.yaml"
+
+# ── Ornith SLM constants ──────────────────────────────────────────────────────
+ORNITH_URL = os.environ.get("ORNITH_SLM_URL", "http://localhost:8080")
+ORNITH_MODEL = os.environ.get("ORNITH_SLM_MODEL", "ornith-1.0-9b")
+ORNITH_HEALTH_ENDPOINT = f"{ORNITH_URL}/health"
+ORNITH_MODELS_ENDPOINT = f"{ORNITH_URL}/v1/models"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -65,7 +71,7 @@ def cmd_init(args: argparse.Namespace) -> None:
     """
     repo = Path(args.repo).resolve()
     domain = args.domain
-    total_steps = 5
+    total_steps = 6
 
     print(f"\n[cortex] Initialising cognitive loop for: {repo}")
     print(f"[cortex] Domain: {domain}\n")
@@ -115,32 +121,55 @@ def cmd_init(args: argparse.Namespace) -> None:
     except (subprocess.CalledProcessError, FileNotFoundError) as exc:
         print(f"[cortex] Warning: Could not create Ollama model: {exc}")
 
+    # Step 6: Check Ornith SLM availability (optional — GPU required)
+    _print_step(6, total_steps, f"Checking Ornith SLM at {ORNITH_URL}")
+    try:
+        import urllib.request as _req
+        import urllib.error as _err
+        with _req.urlopen(ORNITH_HEALTH_ENDPOINT, timeout=3) as _resp:
+            print(f"[cortex] Ornith SLM: running at {ORNITH_URL}")
+            print(f"[cortex] Set LLM_PROVIDER=ornith_slm in ttruthdesk .env to use it.")
+    except (_err.URLError, OSError):
+        print(f"[cortex] Ornith SLM: not running (optional — requires GPU)")
+        print(f"[cortex] To start: docker compose --profile ornith up -d ornith-vllm")
+
     print(f"\n[cortex] Initialisation complete.")
     print(f"[cortex] Next steps:")
     print(f"  1. Edit {cortex_yaml_dst} to configure your domain sources and rules")
     print(f"  2. Run `cortex run` to start the cognitive loop")
-    print(f"  3. POST claims to http://localhost:3100/cognitive/ingest\n")
+    print(f"  3. Run `cortex run --ornith` to also start the Ornith SLM (GPU required)")
+    print(f"  4. POST claims to http://localhost:3100/cognitive/ingest\n")
 
 
 def cmd_run(args: argparse.Namespace) -> None:
     """
-    cortex run
+    cortex run [--ornith]
 
     Starts the cognitive loop stack via docker compose.
+    Pass --ornith to also start the Ornith SLM vLLM service (requires GPU).
     """
     _require_cortex_yaml()
     compose_file = Path(__file__).parent / "docker-compose.yml"
 
-    print("[cortex] Starting cognitive loop stack...")
+    services = ["ollama", "cognitive-loop"]
+    if getattr(args, "ornith", False):
+        services.append("ornith-vllm")
+        print("[cortex] Starting cognitive loop stack (with Ornith SLM)...")
+    else:
+        print("[cortex] Starting cognitive loop stack...")
+
     try:
-        _run([
-            "docker", "compose",
-            "-f", str(compose_file),
-            "up", "-d", "ollama", "cognitive-loop"
-        ])
+        cmd_args = ["docker", "compose", "-f", str(compose_file), "up", "-d"]
+        if getattr(args, "ornith", False):
+            cmd_args += ["--profile", "ornith"]
+        cmd_args += services
+        _run(cmd_args)
         print("[cortex] Stack started.")
         print("[cortex] Cognitive loop API: http://localhost:3100")
         print("[cortex] Ollama API:          http://localhost:11434")
+        if getattr(args, "ornith", False):
+            print(f"[cortex] Ornith SLM API:     {ORNITH_URL}/v1")
+            print(f"[cortex] Set LLM_PROVIDER=ornith_slm in ttruthdesk .env")
     except subprocess.CalledProcessError as exc:
         print(f"[cortex] Error starting stack: {exc}")
         sys.exit(1)
@@ -188,6 +217,20 @@ def cmd_train(args: argparse.Namespace) -> None:
     except (subprocess.CalledProcessError, FileNotFoundError) as exc:
         print(f"[cortex] Warning: Could not refresh Ollama model: {exc}")
 
+    # If Ornith SLM is running, notify that it picks up adapter weights via vLLM LoRA
+    if getattr(args, "ornith", False):
+        print("[cortex] Checking Ornith SLM for LoRA adapter hot-reload...")
+        try:
+            import urllib.request as _req
+            import urllib.error as _err
+            with _req.urlopen(ORNITH_HEALTH_ENDPOINT, timeout=3):
+                print(f"[cortex] Ornith SLM is running at {ORNITH_URL}.")
+                print(f"[cortex] Adapter weights written to: {adapter_dir}")
+                print(f"[cortex] Restart ornith-vllm to load updated adapter:")
+                print(f"[cortex]   docker compose restart ornith-vllm")
+        except (_err.URLError, OSError):
+            print(f"[cortex] Ornith SLM not running — start with: cortex run --ornith")
+
     print("[cortex] Training complete.")
 
 
@@ -221,6 +264,21 @@ def cmd_status(args: argparse.Namespace) -> None:
             print(f"  Cognitive loop API: running — {data}")
     except (urllib.error.URLError, OSError):
         print("  Cognitive loop API: NOT RUNNING (start with: cortex run)")
+
+    # Check Ornith SLM
+    try:
+        with urllib.request.urlopen(ORNITH_HEALTH_ENDPOINT, timeout=3):
+            # Also list loaded models
+            try:
+                with urllib.request.urlopen(ORNITH_MODELS_ENDPOINT, timeout=3) as resp2:
+                    mdata = json.loads(resp2.read())
+                    ornith_models = [m.get("id", "?") for m in mdata.get("data", [])]
+                    print(f"  Ornith SLM:  running at {ORNITH_URL}")
+                    print(f"  Ornith models: {', '.join(ornith_models) or 'none'}")
+            except Exception:
+                print(f"  Ornith SLM:  running at {ORNITH_URL} (model list unavailable)")
+    except (urllib.error.URLError, OSError):
+        print(f"  Ornith SLM:  NOT RUNNING (start with: cortex run --ornith)")
 
     print()
 
@@ -314,12 +372,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--force", action="store_true", help="Overwrite existing cortex.yaml")
 
     # run
-    sub.add_parser("run", help="Start the cognitive loop stack")
+    p_run = sub.add_parser("run", help="Start the cognitive loop stack")
+    p_run.add_argument(
+        "--ornith", action="store_true",
+        help="Also start the Ornith SLM vLLM service (requires NVIDIA GPU)",
+    )
 
     # train
     p_train = sub.add_parser("train", help="Run the LoRA fine-tuning pipeline")
     p_train.add_argument("--corpus", required=True, help="Path to JSONL training corpus")
     p_train.add_argument("--output", default="./adapter", help="Output directory for adapter weights")
+    p_train.add_argument(
+        "--ornith", action="store_true",
+        help="After training, notify Ornith SLM to reload adapter weights",
+    )
 
     # status
     sub.add_parser("status", help="Show cognitive loop stack status")
